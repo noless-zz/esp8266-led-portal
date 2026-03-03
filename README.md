@@ -42,7 +42,7 @@ pio run -t upload --upload-port 192.168.4.1
 Edit defines in `platformio.ini` build_flags:
 | Flag | Default | Description |
 |------|---------|-------------|
-| `NUM_LEDS` | 65 | Number of LEDs |
+| `NUM_LEDS` | 5 | Number of LEDs |
 | `LED_PIN` | D4 | Data pin |
 | `HOSTNAME` | LedController | mDNS / OTA name |
 
