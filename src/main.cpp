@@ -40,6 +40,14 @@ String apSsid;
 String localHostname;
 bool mdnsStarted = false;
 
+struct WifiConnectState {
+  bool active = false;
+  bool resultReady = false;
+  bool success = false;
+  String error;
+  unsigned long startedAt = 0;
+} wifiConnect;
+
 // LED State
 struct LedState {
   bool     power       = true;
@@ -72,7 +80,8 @@ void effectGradient();
 String getStatusJson();
 String getWifiScanJson();
 void buildDeviceIdentity();
-bool connectToWiFi(const String& ssid, const String& pass);
+bool startWiFiConnect(const String& ssid, const String& pass);
+void updateWiFiConnect();
 
 // ─── HTML Page (embedded) ────────────────────────────────
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -539,16 +548,41 @@ function connectWifi() {
   }
   msg.textContent = `Connecting to ${ssid}...`;
   msg.className = 'status-msg';
+
+  const pollConnect = (attempt = 0) => {
+    fetch('/api/wifi/connect').then(r => r.json()).then(d => {
+      if (d.connecting) {
+        if (attempt > 60) {
+          msg.textContent = 'Connection timeout';
+          msg.className = 'status-msg status-err';
+          return;
+        }
+        setTimeout(() => pollConnect(attempt + 1), 500);
+        return;
+      }
+
+      if (d.connected) {
+        msg.textContent = `Connected! Open http://${d.hostname}.local/ or ${d.ip}`;
+        msg.className = 'status-msg status-ok';
+      } else {
+        msg.textContent = d.error || 'Connection failed';
+        msg.className = 'status-msg status-err';
+      }
+      pollStatus();
+    }).catch(() => {
+      msg.textContent = 'Connection status check failed';
+      msg.className = 'status-msg status-err';
+    });
+  };
+
   const p = new URLSearchParams({ ssid, pass });
   fetch('/api/wifi/connect?' + p.toString()).then(r => r.json()).then(d => {
-    if (d.connected) {
-      msg.textContent = `Connected! Open http://${d.hostname}.local/ or ${d.ip}`;
-      msg.className = 'status-msg status-ok';
-    } else {
-      msg.textContent = d.error || 'Connection failed';
+    if (!d.connecting) {
+      msg.textContent = d.error || 'Failed to start connection';
       msg.className = 'status-msg status-err';
+      return;
     }
-    pollStatus();
+    pollConnect();
   }).catch(() => {
     msg.textContent = 'Connection request failed';
     msg.className = 'status-msg status-err';
@@ -601,6 +635,7 @@ void loop() {
   } else if (WiFi.status() == WL_CONNECTED) {
     setupMDNS();
   }
+  updateWiFiConnect();
   ArduinoOTA.handle();
   updateLEDs();
 }
@@ -844,19 +879,32 @@ String getWifiScanJson() {
   return out;
 }
 
-bool connectToWiFi(const String& ssid, const String& pass) {
+bool startWiFiConnect(const String& ssid, const String& pass) {
   if (ssid.length() == 0) {
     return false;
   }
+
+  if (wifiConnect.active) {
+    return false;
+  }
+
+  wifiConnect.active = true;
+  wifiConnect.resultReady = false;
+  wifiConnect.success = false;
+  wifiConnect.error = "";
+  wifiConnect.startedAt = millis();
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.hostname(localHostname.c_str());
   WiFi.begin(ssid.c_str(), pass.c_str());
   Serial.println("Connecting to SSID: " + ssid);
 
-  unsigned long started = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - started < 15000) {
-    delay(250);
+  return true;
+}
+
+void updateWiFiConnect() {
+  if (!wifiConnect.active) {
+    return;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -866,10 +914,21 @@ bool connectToWiFi(const String& ssid, const String& pass) {
     setupMDNS();
     Serial.print("WiFi connected. IP: ");
     Serial.println(WiFi.localIP());
-    return true;
+
+    wifiConnect.active = false;
+    wifiConnect.resultReady = true;
+    wifiConnect.success = true;
+    wifiConnect.error = "";
+    return;
   }
-  Serial.println("WiFi connect failed");
-  return false;
+
+  if (millis() - wifiConnect.startedAt >= 15000) {
+    Serial.println("WiFi connect failed");
+    wifiConnect.active = false;
+    wifiConnect.resultReady = true;
+    wifiConnect.success = false;
+    wifiConnect.error = "Could not connect. Check password/signal.";
+  }
 }
 
 // ─── Parse hex color ─────────────────────────────────────
@@ -963,22 +1022,45 @@ void setupWebServer() {
   });
 
   server.on("/api/wifi/connect", HTTP_GET, [](AsyncWebServerRequest *req) {
-    if (!req->hasParam("ssid")) {
-      req->send(400, "application/json", "{\"connected\":false,\"error\":\"Missing SSID\"}");
-      return;
-    }
-    String ssid = req->getParam("ssid")->value();
-    String pass = req->hasParam("pass") ? req->getParam("pass")->value() : "";
-    bool ok = connectToWiFi(ssid, pass);
-
     JsonDocument doc;
-    doc["connected"] = ok;
     doc["hostname"] = localHostname;
-    doc["ip"] = ok ? WiFi.localIP().toString() : "";
-    if (!ok) doc["error"] = "Could not connect. Check password/signal.";
+
+    if (req->hasParam("ssid")) {
+      if (wifiConnect.active) {
+        doc["connecting"] = true;
+      } else {
+        String ssid = req->getParam("ssid")->value();
+        String pass = req->hasParam("pass") ? req->getParam("pass")->value() : "";
+        if (startWiFiConnect(ssid, pass)) {
+          doc["connecting"] = true;
+        } else {
+          doc["connecting"] = false;
+          doc["connected"] = false;
+          doc["error"] = "Missing SSID or connection already in progress";
+        }
+      }
+    } else if (wifiConnect.active) {
+      doc["connecting"] = true;
+    } else if (wifiConnect.resultReady) {
+      doc["connecting"] = false;
+      doc["connected"] = wifiConnect.success;
+      doc["ip"] = wifiConnect.success ? WiFi.localIP().toString() : "";
+      if (!wifiConnect.success) {
+        doc["error"] = wifiConnect.error;
+      }
+      wifiConnect.resultReady = false;
+    } else {
+      doc["connecting"] = false;
+      doc["connected"] = WiFi.status() == WL_CONNECTED;
+      doc["ip"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+      if (WiFi.status() != WL_CONNECTED) {
+        doc["error"] = "No active connection attempt";
+      }
+    }
+
     String out;
     serializeJson(doc, out);
-    req->send(ok ? 200 : 500, "application/json", out);
+    req->send(200, "application/json", out);
   });
 
   // ── Firmware Update (HTTP) ──
