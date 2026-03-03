@@ -64,6 +64,19 @@ unsigned long lastStaRetryAt = 0;
 unsigned long lastClientActivity = 0;
 int activeClientCount = 0;
 
+struct OtaStatusState {
+  bool inProgress = false;
+  bool approved = false;
+  bool lastSuccess = false;
+  uint8_t lastErrorCode = 0;
+  String lastErrorText;
+  String lastFileName;
+  size_t expectedBytes = 0;
+  size_t writtenBytes = 0;
+  unsigned long startedAt = 0;
+  unsigned long finishedAt = 0;
+} otaStatus;
+
 struct WifiConnectState {
   bool active = false;
   bool resultReady = false;
@@ -140,6 +153,9 @@ String buildWifiFailureHint();
 String getCaptivePortalUrl();
 void loadLedPowerState();
 void saveLedPowerState();
+uint32_t getMaxUpdateSize();
+const char* updateErrorToString(uint8_t error);
+String getOtaStatusJson();
 
 // ─── HTML Page (embedded) ────────────────────────────────
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -492,6 +508,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <script>
 const API = '';
 let debounce = null;
+let fwPrecheckOk = false;
+let fwPrecheckSummary = '';
 
 function send(url) {
   fetch(API + url).catch(e => console.warn(e));
@@ -521,21 +539,70 @@ function setEffect(idx) {
 }
 
 function fileSelected(input) {
-  if (input.files.length > 0) {
-    document.getElementById('fileName').textContent = input.files[0].name;
-    document.getElementById('uploadBtn').disabled = false;
-  }
+  const uploadBtn = document.getElementById('uploadBtn');
+  const statusMsg = document.getElementById('statusMsg');
+  fwPrecheckOk = false;
+  fwPrecheckSummary = '';
+  uploadBtn.disabled = true;
+
+  if (input.files.length === 0) return;
+
+  const file = input.files[0];
+  document.getElementById('fileName').textContent = file.name;
+  statusMsg.textContent = 'Checking firmware...';
+  statusMsg.className = 'status-msg';
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    const bytes = new Uint8Array(reader.result);
+    const magic = bytes.length > 0 ? bytes[0] : 0;
+    fetch(`/api/update/precheck?name=${encodeURIComponent(file.name)}&size=${file.size}&magic=${magic}`)
+      .then(r => r.json())
+      .then(d => {
+        fwPrecheckOk = !!d.ok;
+        fwPrecheckSummary = d.summary || '';
+        if (d.ok) {
+          uploadBtn.disabled = false;
+          statusMsg.textContent = `Precheck OK: ${d.summary}`;
+          statusMsg.className = 'status-msg status-ok';
+        } else {
+          uploadBtn.disabled = true;
+          statusMsg.textContent = `Precheck failed: ${d.error || 'Invalid firmware file'}`;
+          statusMsg.className = 'status-msg status-err';
+        }
+      })
+      .catch(() => {
+        uploadBtn.disabled = true;
+        statusMsg.textContent = 'Precheck request failed';
+        statusMsg.className = 'status-msg status-err';
+      });
+  };
+  reader.onerror = () => {
+    uploadBtn.disabled = true;
+    statusMsg.textContent = 'Failed to read firmware file';
+    statusMsg.className = 'status-msg status-err';
+  };
+  reader.readAsArrayBuffer(file.slice(0, 1));
 }
 
 function uploadFirmware() {
   const file = document.getElementById('fwFile').files[0];
   if (!file) return;
+  const statusMsg = document.getElementById('statusMsg');
+  if (!fwPrecheckOk) {
+    statusMsg.textContent = 'Run precheck first (re-select firmware file)';
+    statusMsg.className = 'status-msg status-err';
+    return;
+  }
+  if (!confirm(`Approve firmware upload?\n\n${fwPrecheckSummary}`)) {
+    return;
+  }
+
   const formData = new FormData();
   formData.append('firmware', file);
   const xhr = new XMLHttpRequest();
   const progBar = document.getElementById('progBar');
   const progFill = document.getElementById('progFill');
-  const statusMsg = document.getElementById('statusMsg');
   progBar.style.display = 'block';
   statusMsg.textContent = '';
   statusMsg.className = 'status-msg';
@@ -545,22 +612,26 @@ function uploadFirmware() {
     if (e.lengthComputable) progFill.style.width = (e.loaded / e.total * 100) + '%';
   });
   xhr.addEventListener('load', () => {
-    if (xhr.status === 200) {
-      statusMsg.textContent = 'Update OK! Rebooting...';
+    let payload = null;
+    try { payload = JSON.parse(xhr.responseText); } catch (_) {}
+    if (xhr.status === 200 && payload && payload.ok) {
+      statusMsg.textContent = `Update OK (${payload.written || 0} bytes). Rebooting...`;
       statusMsg.className = 'status-msg status-ok';
       setTimeout(() => location.reload(), 5000);
-    } else {
-      statusMsg.textContent = 'Upload failed: ' + xhr.responseText;
-      statusMsg.className = 'status-msg status-err';
-      document.getElementById('uploadBtn').disabled = false;
+      return;
     }
+
+    const err = payload && payload.error ? payload.error : xhr.responseText;
+    statusMsg.textContent = `Upload failed: ${err}`;
+    statusMsg.className = 'status-msg status-err';
+    document.getElementById('uploadBtn').disabled = false;
   });
   xhr.addEventListener('error', () => {
     statusMsg.textContent = 'Connection error';
     statusMsg.className = 'status-msg status-err';
     document.getElementById('uploadBtn').disabled = false;
   });
-  xhr.open('POST', '/api/update');
+  xhr.open('POST', '/api/update?approve=1');
   xhr.send(formData);
 }
 
@@ -1022,6 +1093,49 @@ void saveLedPowerState() {
   Serial.printf("[LED] Saved power state: %s\n", state.power ? "ON" : "OFF");
 }
 
+uint32_t getMaxUpdateSize() {
+  return (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+}
+
+const char* updateErrorToString(uint8_t error) {
+  switch (error) {
+    case UPDATE_ERROR_OK: return "OK";
+    case UPDATE_ERROR_WRITE: return "Flash write failed";
+    case UPDATE_ERROR_ERASE: return "Flash erase failed";
+    case UPDATE_ERROR_READ: return "Flash read failed";
+    case UPDATE_ERROR_SPACE: return "Not enough flash space";
+    case UPDATE_ERROR_SIZE: return "Binary size mismatch";
+    case UPDATE_ERROR_STREAM: return "Upload stream timeout/error";
+    case UPDATE_ERROR_MD5: return "MD5 validation failed";
+    case UPDATE_ERROR_MAGIC_BYTE: return "Invalid firmware magic byte";
+    case UPDATE_ERROR_FLASH_CONFIG: return "Flash config mismatch";
+    case UPDATE_ERROR_NEW_FLASH_CONFIG: return "New flash config invalid";
+    case UPDATE_ERROR_BOOTSTRAP: return "Bootstrap validation failed";
+    case UPDATE_ERROR_OOM: return "Out of memory during update";
+    case UPDATE_ERROR_NO_DATA: return "No OTA data received";
+    default: return "Unknown OTA error";
+  }
+}
+
+String getOtaStatusJson() {
+  JsonDocument doc;
+  doc["in_progress"] = otaStatus.inProgress;
+  doc["approved"] = otaStatus.approved;
+  doc["last_success"] = otaStatus.lastSuccess;
+  doc["last_error_code"] = otaStatus.lastErrorCode;
+  doc["last_error_text"] = otaStatus.lastErrorText;
+  doc["last_file"] = otaStatus.lastFileName;
+  doc["expected_bytes"] = otaStatus.expectedBytes;
+  doc["written_bytes"] = otaStatus.writtenBytes;
+  doc["started_at"] = otaStatus.startedAt;
+  doc["finished_at"] = otaStatus.finishedAt;
+  doc["max_size"] = getMaxUpdateSize();
+  doc["free_heap"] = ESP.getFreeHeap();
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
 const char* wifiStatusToString(wl_status_t status) {
   switch (status) {
     case WL_NO_SHIELD: return "NO_SHIELD";
@@ -1388,38 +1502,141 @@ void setupWebServer() {
     req->send(200, "application/json", out);
   });
 
+  server.on("/api/update/status", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send(200, "application/json", getOtaStatusJson());
+  });
+
+  server.on("/api/update/precheck", HTTP_GET, [](AsyncWebServerRequest *req) {
+    JsonDocument doc;
+    if (!req->hasParam("name") || !req->hasParam("size") || !req->hasParam("magic")) {
+      doc["ok"] = false;
+      doc["error"] = "Missing name/size/magic";
+    } else {
+      String name = req->getParam("name")->value();
+      size_t size = (size_t) req->getParam("size")->value().toInt();
+      int magic = req->getParam("magic")->value().toInt();
+      uint32_t maxSize = getMaxUpdateSize();
+
+      bool extOk = name.endsWith(".bin") || name.endsWith(".BIN");
+      bool sizeOk = size > 0 && size <= maxSize;
+      bool magicOk = (magic == 0xE9);
+
+      doc["ok"] = extOk && sizeOk && magicOk;
+      doc["ext_ok"] = extOk;
+      doc["size_ok"] = sizeOk;
+      doc["magic_ok"] = magicOk;
+      doc["max_size"] = maxSize;
+      doc["file_size"] = size;
+      doc["magic"] = magic;
+
+      if (doc["ok"].as<bool>()) {
+        doc["summary"] = String("name=") + name + ", size=" + String(size) + " bytes, max=" + String(maxSize) + ", magic=0xE9";
+      } else {
+        String err;
+        if (!extOk) err += "File must be .bin. ";
+        if (!sizeOk) err += "File too large for available OTA space. ";
+        if (!magicOk) err += "Invalid firmware header (expected 0xE9).";
+        doc["error"] = err;
+      }
+    }
+    String out;
+    serializeJson(doc, out);
+    req->send(200, "application/json", out);
+  });
+
   // ── Firmware Update (HTTP) ──
   server.on("/api/update", HTTP_POST,
     // Response handler
     [](AsyncWebServerRequest *req) {
-      bool success = !Update.hasError();
-      AsyncWebServerResponse *resp = req->beginResponse(
-        success ? 200 : 500,
-        "text/plain",
-        success ? "OK - Rebooting..." : "Update Failed"
-      );
-      resp->addHeader("Connection", "close");
-      req->send(resp);
+      JsonDocument doc;
+      bool approved = req->hasParam("approve") && req->getParam("approve")->value() == "1";
+      bool success = approved && !Update.hasError() && otaStatus.expectedBytes > 0 && otaStatus.writtenBytes == otaStatus.expectedBytes;
+
+      otaStatus.inProgress = false;
+      otaStatus.finishedAt = millis();
+      otaStatus.lastSuccess = success;
+      otaStatus.approved = approved;
+
+      if (!approved) {
+        otaStatus.lastErrorCode = UPDATE_ERROR_STREAM;
+        otaStatus.lastErrorText = "Upload not approved. Run precheck and confirm upload in Web UI.";
+      } else if (Update.hasError()) {
+        otaStatus.lastErrorCode = Update.getError();
+        otaStatus.lastErrorText = updateErrorToString(otaStatus.lastErrorCode);
+      } else if (otaStatus.writtenBytes != otaStatus.expectedBytes) {
+        otaStatus.lastErrorCode = UPDATE_ERROR_STREAM;
+        otaStatus.lastErrorText = "Upload incomplete (written bytes mismatch).";
+      } else {
+        otaStatus.lastErrorCode = UPDATE_ERROR_OK;
+        otaStatus.lastErrorText = "OK";
+      }
+
+      doc["ok"] = success;
+      doc["approved"] = approved;
+      doc["written"] = otaStatus.writtenBytes;
+      doc["expected"] = otaStatus.expectedBytes;
+      doc["error_code"] = otaStatus.lastErrorCode;
+      doc["error"] = otaStatus.lastErrorText;
+      doc["file"] = otaStatus.lastFileName;
+
+      String out;
+      serializeJson(doc, out);
+      req->send(success ? 200 : 500, "application/json", out);
+
       if (success) {
-        delay(500);
+        delay(600);
         ESP.restart();
       }
     },
     // Upload handler
     [](AsyncWebServerRequest *req, String filename, size_t index, uint8_t *data, size_t len, bool final) {
       if (index == 0) {
+        bool approved = req->hasParam("approve") && req->getParam("approve")->value() == "1";
+        if (!approved) {
+          otaStatus.inProgress = false;
+          otaStatus.lastSuccess = false;
+          otaStatus.lastErrorCode = UPDATE_ERROR_STREAM;
+          otaStatus.lastErrorText = "Missing approve=1";
+          otaStatus.lastFileName = filename;
+          return;
+        }
+
         otaVisualActive = true;
+        otaStatus.inProgress = true;
+        otaStatus.approved = true;
+        otaStatus.lastSuccess = false;
+        otaStatus.lastErrorCode = 0;
+        otaStatus.lastErrorText = "";
+        otaStatus.lastFileName = filename;
+        otaStatus.expectedBytes = req->contentLength();
+        otaStatus.writtenBytes = 0;
+        otaStatus.startedAt = millis();
+
         Serial.printf("Update: %s (%u bytes)\n", filename.c_str(), req->contentLength());
         // Disable LEDs during update
         FastLED.clear(true);
-        uint32_t maxSize = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+        uint32_t maxSize = getMaxUpdateSize();
+
+        if (req->contentLength() == 0 || req->contentLength() > maxSize) {
+          otaStatus.lastErrorCode = UPDATE_ERROR_SPACE;
+          otaStatus.lastErrorText = "Firmware size invalid for current OTA partition.";
+          otaStatus.inProgress = false;
+          return;
+        }
+
         if (!Update.begin(maxSize, U_FLASH)) {
+          otaStatus.lastErrorCode = Update.getError();
+          otaStatus.lastErrorText = updateErrorToString(otaStatus.lastErrorCode);
           Update.printError(Serial);
         }
       }
       if (!Update.hasError()) {
         if (Update.write(data, len) != len) {
+          otaStatus.lastErrorCode = Update.getError();
+          otaStatus.lastErrorText = updateErrorToString(otaStatus.lastErrorCode);
           Update.printError(Serial);
+        } else {
+          otaStatus.writtenBytes = index + len;
         }
         // Show progress on LEDs
         if (req->contentLength() > 0) {
@@ -1434,12 +1651,15 @@ void setupWebServer() {
       if (final) {
         if (Update.end(true)) {
           Serial.printf("Update OK: %u bytes\n", index + len);
+          otaStatus.writtenBytes = index + len;
           int statusLeds = min(NUM_LEDS, OTA_STATUS_LEDS);
           FastLED.clear();
           fill_solid(leds, statusLeds, CRGB::Green);
           FastLED.show();
           otaVisualActive = false;
         } else {
+          otaStatus.lastErrorCode = Update.getError();
+          otaStatus.lastErrorText = updateErrorToString(otaStatus.lastErrorCode);
           Update.printError(Serial);
           int statusLeds = min(NUM_LEDS, OTA_STATUS_LEDS);
           FastLED.clear();
