@@ -14,6 +14,7 @@
 #include <DNSServer.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
+#include <ESP8266mDNS.h>
 #include <FastLED.h>
 #include <Updater.h>
 
@@ -25,7 +26,7 @@
 #define LED_PIN D4
 #endif
 
-const char* AP_SSID     = "LED-Controller";
+const char* AP_SSID_BASE = "LED-Controller";
 const char* AP_PASS     = "";          // Open network for captive portal
 const char* OTA_PASS    = "admin123";  // OTA & upload password
 const byte  DNS_PORT    = 53;
@@ -34,6 +35,10 @@ const byte  DNS_PORT    = 53;
 CRGB leds[NUM_LEDS];
 AsyncWebServer server(80);
 DNSServer dnsServer;
+String deviceId;
+String apSsid;
+String localHostname;
+bool mdnsStarted = false;
 
 // LED State
 struct LedState {
@@ -51,6 +56,7 @@ unsigned long lastUpdate = 0;
 // ─── Forward Declarations ────────────────────────────────
 void setupWiFi();
 void setupDNS();
+void setupMDNS();
 void setupOTA();
 void setupWebServer();
 void setupLEDs();
@@ -64,6 +70,9 @@ void effectTwinkle();
 void effectWave();
 void effectGradient();
 String getStatusJson();
+String getWifiScanJson();
+void buildDeviceIdentity();
+bool connectToWiFi(const String& ssid, const String& pass);
 
 // ─── HTML Page (embedded) ────────────────────────────────
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -281,6 +290,33 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     color: var(--dim);
     padding: 4px 0;
   }
+  .wifi-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  select, input[type=password] {
+    width: 100%;
+    background: #1a1a2a;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    font-family: inherit;
+    font-size: 0.7rem;
+  }
+  .mini-btn {
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 0.65rem;
+    background: #1a1a2a;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .mini-btn:hover { border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -339,6 +375,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
+  <!-- WiFi Setup -->
+  <div class="card">
+    <div class="card-title">WIFI SETUP</div>
+    <div class="wifi-row" style="margin-bottom:8px">
+      <select id="ssidList"></select>
+      <button class="mini-btn" onclick="scanWifi()">SCAN</button>
+    </div>
+    <div class="wifi-row">
+      <input type="password" id="wifiPass" placeholder="WiFi password">
+      <button class="mini-btn" onclick="connectWifi()">CONNECT</button>
+    </div>
+    <div class="status-msg" id="wifiMsg"></div>
+  </div>
+
   <!-- OTA Update -->
   <div class="card">
     <div class="card-title">FIRMWARE UPDATE</div>
@@ -355,7 +405,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="card">
     <div class="card-title">DEVICE INFO</div>
     <div class="info-row"><span>LEDs</span><span>65</span></div>
-    <div class="info-row"><span>IP</span><span>192.168.4.1</span></div>
+    <div class="info-row"><span>AP SSID</span><span id="apSsid">-</span></div>
+    <div class="info-row"><span>Host</span><span id="host">-</span></div>
+    <div class="info-row"><span>IP</span><span id="ip">-</span></div>
     <div class="info-row"><span>Heap</span><span id="heap">-</span></div>
   </div>
 </div>
@@ -435,10 +487,69 @@ function uploadFirmware() {
   xhr.send(formData);
 }
 
+function scanWifi() {
+  const list = document.getElementById('ssidList');
+  const msg = document.getElementById('wifiMsg');
+  msg.textContent = 'Scanning...';
+  msg.className = 'status-msg';
+  fetch('/api/wifi/scan').then(r => r.json()).then(d => {
+    list.innerHTML = '';
+    if (!d.networks || d.networks.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No networks found';
+      list.appendChild(opt);
+      msg.textContent = 'No SSIDs detected';
+      return;
+    }
+    d.networks.forEach(n => {
+      const opt = document.createElement('option');
+      opt.value = n.ssid;
+      opt.textContent = `${n.ssid} (${n.rssi} dBm)`;
+      list.appendChild(opt);
+    });
+    msg.textContent = `Found ${d.networks.length} networks`;
+    msg.className = 'status-msg status-ok';
+  }).catch(() => {
+    msg.textContent = 'Scan failed';
+    msg.className = 'status-msg status-err';
+  });
+}
+
+function connectWifi() {
+  const ssid = document.getElementById('ssidList').value;
+  const pass = document.getElementById('wifiPass').value;
+  const msg = document.getElementById('wifiMsg');
+  if (!ssid) {
+    msg.textContent = 'Select an SSID first';
+    msg.className = 'status-msg status-err';
+    return;
+  }
+  msg.textContent = `Connecting to ${ssid}...`;
+  msg.className = 'status-msg';
+  const p = new URLSearchParams({ ssid, pass });
+  fetch('/api/wifi/connect?' + p.toString()).then(r => r.json()).then(d => {
+    if (d.connected) {
+      msg.textContent = `Connected! Open http://${d.hostname}.local/ or ${d.ip}`;
+      msg.className = 'status-msg status-ok';
+    } else {
+      msg.textContent = d.error || 'Connection failed';
+      msg.className = 'status-msg status-err';
+    }
+    pollStatus();
+  }).catch(() => {
+    msg.textContent = 'Connection request failed';
+    msg.className = 'status-msg status-err';
+  });
+}
+
 // Poll status
 function pollStatus() {
   fetch('/api/status').then(r => r.json()).then(d => {
     document.getElementById('heap').textContent = Math.round(d.heap / 1024) + ' KB';
+    document.getElementById('apSsid').textContent = d.ap_ssid || '-';
+    document.getElementById('host').textContent = d.hostname ? (d.hostname + '.local') : '-';
+    document.getElementById('ip').textContent = d.ip || '-';
     document.getElementById('powerToggle').classList.toggle('on', d.power);
     document.getElementById('brightness').value = d.brightness;
     document.getElementById('brVal').textContent = d.brightness;
@@ -448,6 +559,7 @@ function pollStatus() {
   }).catch(() => {});
 }
 pollStatus();
+scanWifi();
 setInterval(pollStatus, 5000);
 </script>
 </body>
@@ -459,40 +571,88 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n\n=== LED Controller Starting ===");
 
+  buildDeviceIdentity();
   setupLEDs();
   setupWiFi();
   setupDNS();
+  setupMDNS();
   setupOTA();
   setupWebServer();
 
-  Serial.println("=== Ready! Connect to WiFi: " + String(AP_SSID) + " ===");
+  Serial.println("=== Ready! AP: " + apSsid + " / Host: " + localHostname + ".local ===");
 }
 
 void loop() {
   dnsServer.processNextRequest();
+  if (mdnsStarted) {
+    MDNS.update();
+  } else if (WiFi.status() == WL_CONNECTED) {
+    setupMDNS();
+  }
   ArduinoOTA.handle();
   updateLEDs();
 }
 
+void buildDeviceIdentity() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  deviceId = mac.substring(mac.length() - 6);
+  deviceId.toUpperCase();
+  apSsid = String(AP_SSID_BASE) + "-" + deviceId;
+  localHostname = String("ledportal-") + deviceId;
+  localHostname.toLowerCase();
+}
+
 // ─── WiFi AP ─────────────────────────────────────────────
 void setupWiFi() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.persistent(true);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.hostname(localHostname.c_str());
+  WiFi.softAP(apSsid.c_str(), AP_PASS);
   delay(100);
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
+
+  WiFi.begin(); // try saved STA credentials
+  unsigned long started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < 8000) {
+    delay(200);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("STA connected IP: ");
+    Serial.println(WiFi.localIP());
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+  }
 }
 
 // ─── DNS (Captive Portal) ────────────────────────────────
 void setupDNS() {
+  if ((WiFi.getMode() & WIFI_AP) == 0) {
+    return;
+  }
   // Redirect all DNS queries to our IP → captive portal
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
 }
 
+void setupMDNS() {
+  if (WiFi.status() != WL_CONNECTED || mdnsStarted) {
+    return;
+  }
+  if (MDNS.begin(localHostname.c_str())) {
+    mdnsStarted = true;
+    Serial.print("mDNS: http://");
+    Serial.print(localHostname);
+    Serial.println(".local");
+  } else {
+    Serial.println("mDNS start failed");
+  }
+}
+
 // ─── OTA ─────────────────────────────────────────────────
 void setupOTA() {
-  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.setHostname(localHostname.c_str());
   ArduinoOTA.setPassword(OTA_PASS);
   ArduinoOTA.onStart([]() {
     FastLED.clear(true);
@@ -624,6 +784,10 @@ String getStatusJson() {
   doc["effect"]     = state.effect;
   doc["speed"]      = state.speed;
   doc["heap"]       = ESP.getFreeHeap();
+  doc["ap_ssid"]    = apSsid;
+  doc["hostname"]   = localHostname;
+  doc["connected"]  = WiFi.status() == WL_CONNECTED;
+  doc["ip"]         = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   char c1[8], c2[8];
   snprintf(c1, sizeof(c1), "#%02x%02x%02x", state.color1.r, state.color1.g, state.color1.b);
   snprintf(c2, sizeof(c2), "#%02x%02x%02x", state.color2.r, state.color2.g, state.color2.b);
@@ -632,6 +796,54 @@ String getStatusJson() {
   String out;
   serializeJson(doc, out);
   return out;
+}
+
+String getWifiScanJson() {
+  JsonDocument doc;
+  JsonArray arr = doc["networks"].to<JsonArray>();
+
+  int count = WiFi.scanNetworks();
+  for (int i = 0; i < count; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    JsonObject obj = arr.add<JsonObject>();
+    obj["ssid"] = ssid;
+    obj["rssi"] = WiFi.RSSI(i);
+    obj["enc"]  = (WiFi.encryptionType(i) != ENC_TYPE_NONE);
+  }
+  WiFi.scanDelete();
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+bool connectToWiFi(const String& ssid, const String& pass) {
+  if (ssid.length() == 0) {
+    return false;
+  }
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.hostname(localHostname.c_str());
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  Serial.println("Connecting to SSID: " + ssid);
+
+  unsigned long started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < 15000) {
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    dnsServer.stop();
+    setupMDNS();
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  Serial.println("WiFi connect failed");
+  return false;
 }
 
 // ─── Parse hex color ─────────────────────────────────────
@@ -718,6 +930,29 @@ void setupWebServer() {
       state.color2 = parseHexColor(req->getParam("c2")->value());
     }
     req->send(200, "application/json", getStatusJson());
+  });
+
+  server.on("/api/wifi/scan", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send(200, "application/json", getWifiScanJson());
+  });
+
+  server.on("/api/wifi/connect", HTTP_GET, [](AsyncWebServerRequest *req) {
+    if (!req->hasParam("ssid")) {
+      req->send(400, "application/json", "{\"connected\":false,\"error\":\"Missing SSID\"}");
+      return;
+    }
+    String ssid = req->getParam("ssid")->value();
+    String pass = req->hasParam("pass") ? req->getParam("pass")->value() : "";
+    bool ok = connectToWiFi(ssid, pass);
+
+    JsonDocument doc;
+    doc["connected"] = ok;
+    doc["hostname"] = localHostname;
+    doc["ip"] = ok ? WiFi.localIP().toString() : "";
+    if (!ok) doc["error"] = "Could not connect. Check password/signal.";
+    String out;
+    serializeJson(doc, out);
+    req->send(ok ? 200 : 500, "application/json", out);
   });
 
   // ── Firmware Update (HTTP) ──
