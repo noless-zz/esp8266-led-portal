@@ -37,7 +37,10 @@ const int   OTA_STATUS_LEDS = 5;
 const int   EEPROM_SIZE = 16;
 const int   EEPROM_MAGIC_ADDR = 0;
 const int   EEPROM_POWER_ADDR = 1;
+const int   EEPROM_CRASH_COUNT_ADDR = 2;
 const uint8_t EEPROM_MAGIC = 0xA7;
+const uint8_t SAFE_MODE_CRASH_THRESHOLD = 3;
+const unsigned long SAFE_MODE_CLEAR_UPTIME_MS = 120000;
 
 // ─── Globals ─────────────────────────────────────────────
 CRGB leds[NUM_LEDS];
@@ -48,12 +51,32 @@ String apSsid;
 String localHostname;
 bool mdnsStarted = false;
 bool otaVisualActive = false;
+bool safeModeActive = false;
+uint8_t bootCrashCount = 0;
+String lastResetReason;
+unsigned long bootStartedAt = 0;
+bool crashCounterCleared = false;
+
+uint32_t loopLatencyUs = 0;
+uint32_t loopLatencyMaxUs = 0;
+unsigned long loopLastMicros = 0;
+unsigned long heapWindowStartedAt = 0;
+uint32_t heapWindowStart = 0;
+uint32_t heapWindowMin = 0;
+uint32_t heapWindowMax = 0;
+int32_t heapTrendDelta = 0;
+unsigned long lastHeapSampleAt = 0;
+bool wifiWasConnected = false;
+bool wifiEverConnected = false;
+uint32_t wifiReconnectCount = 0;
 
 struct ScanCacheEntry {
   String ssid;
   int32_t rssi = 0;
   int channel = -1;
   int enc = -1;
+  bool hasBssid = false;
+  uint8_t bssid[6] = {0};
 };
 ScanCacheEntry scanCache[MAX_SCAN_CACHE];
 int scanCacheCount = 0;
@@ -92,6 +115,8 @@ struct WifiConnectState {
   int targetChannel = -1;
   int32_t targetRssi = 0;
   int targetEnc = -1;
+  bool targetHasBssid = false;
+  uint8_t targetBssid[6] = {0};
   unsigned long lastElapsedMs = 0;
 } wifiConnect;
 
@@ -153,6 +178,11 @@ String buildWifiFailureHint();
 String getCaptivePortalUrl();
 void loadLedPowerState();
 void saveLedPowerState();
+void evaluateSafeModeOnBoot();
+bool isCrashResetReason(const String& reason);
+void applySafeModeDefaults();
+void maybeClearCrashCounterAfterStableUptime();
+void updateTelemetry();
 uint32_t getMaxUpdateSize();
 const char* updateErrorToString(uint8_t error);
 String getOtaStatusJson();
@@ -503,6 +533,17 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="info-row"><span>Channel</span><span id="staChannel">-</span></div>
     <div class="info-row"><span>BSSID</span><span id="staBssid">-</span></div>
   </div>
+
+  <!-- Telemetry -->
+  <div class="card">
+    <div class="card-title">TELEMETRY</div>
+    <div class="info-row"><span>Mode</span><span id="safeMode">-</span></div>
+    <div class="info-row"><span>Reset</span><span id="resetReason">-</span></div>
+    <div class="info-row"><span>Crash Count</span><span id="crashCount">-</span></div>
+    <div class="info-row"><span>Loop (us)</span><span id="loopLatency">-</span></div>
+    <div class="info-row"><span>Heap Trend</span><span id="heapTrend">-</span></div>
+    <div class="info-row"><span>WiFi Reconnects</span><span id="wifiReconn">-</span></div>
+  </div>
 </div>
 
 <script>
@@ -754,6 +795,15 @@ function pollStatus() {
     } else {
       staCard.style.display = 'none';
     }
+
+    document.getElementById('safeMode').textContent = d.safe_mode ? 'SAFE (AP-only)' : 'NORMAL';
+    document.getElementById('resetReason').textContent = d.reset_reason || '-';
+    document.getElementById('crashCount').textContent = (d.crash_count ?? 0).toString();
+    document.getElementById('loopLatency').textContent = `${d.loop_latency_us || 0} / max ${d.loop_latency_max_us || 0}`;
+    const trend = d.heap_trend_delta || 0;
+    const trendSign = trend > 0 ? '+' : '';
+    document.getElementById('heapTrend').textContent = `${trendSign}${trend} (min ${d.heap_trend_min || 0}, max ${d.heap_trend_max || 0})`;
+    document.getElementById('wifiReconn').textContent = (d.wifi_reconnects ?? 0).toString();
   }).catch(() => {});
 }
 pollStatus();
@@ -768,10 +818,15 @@ setInterval(pollStatus, 5000);
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\n=== LED Controller Starting ===");
+  bootStartedAt = millis();
+  evaluateSafeModeOnBoot();
 
   buildDeviceIdentity();
   setupLEDs();
   loadLedPowerState();
+  if (safeModeActive) {
+    applySafeModeDefaults();
+  }
   setupWiFi();
   setupDNS();
   setupMDNS();
@@ -788,9 +843,13 @@ void loop() {
   } else if (WiFi.status() == WL_CONNECTED) {
     setupMDNS();
   }
-  updateWiFiConnect();
-  checkPeriodicStaRetry();
+  if (!safeModeActive) {
+    updateWiFiConnect();
+    checkPeriodicStaRetry();
+  }
   trackClientActivity();
+  updateTelemetry();
+  maybeClearCrashCounterAfterStableUptime();
   ArduinoOTA.handle();
   updateLEDs();
 }
@@ -808,6 +867,16 @@ void buildDeviceIdentity() {
 // ─── WiFi AP ─────────────────────────────────────────────
 void setupWiFi() {
   WiFi.persistent(true);
+  if (safeModeActive) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(apSsid.c_str(), AP_PASS);
+    delay(100);
+    Serial.println("[SAFE MODE] AP-only mode enabled");
+    Serial.print("[SAFE MODE] AP IP: ");
+    Serial.println(WiFi.softAPIP());
+    return;
+  }
+
   WiFi.mode(WIFI_AP_STA);
   WiFi.hostname(localHostname.c_str());
   WiFi.softAP(apSsid.c_str(), AP_PASS);
@@ -816,7 +885,7 @@ void setupWiFi() {
   Serial.println(WiFi.softAPIP());
 
   if (WiFi.SSID().length() > 0 && beginWiFiConnectAttempt(8000, false)) {
-    WiFi.begin(); // try saved STA credentials (non-blocking)
+    WiFi.begin();
     Serial.println("Trying saved STA credentials...");
   }
 }
@@ -1018,6 +1087,15 @@ String getStatusJson() {
   }
   doc["ap_active"]  = (WiFi.getMode() & WIFI_AP) != 0;
   doc["ap_clients"] = WiFi.softAPgetStationNum();
+  doc["safe_mode"] = safeModeActive;
+  doc["reset_reason"] = lastResetReason;
+  doc["crash_count"] = bootCrashCount;
+  doc["loop_latency_us"] = loopLatencyUs;
+  doc["loop_latency_max_us"] = loopLatencyMaxUs;
+  doc["heap_trend_delta"] = heapTrendDelta;
+  doc["heap_trend_min"] = heapWindowMin;
+  doc["heap_trend_max"] = heapWindowMax;
+  doc["wifi_reconnects"] = wifiReconnectCount;
   
   char c1[8], c2[8];
   snprintf(c1, sizeof(c1), "#%02x%02x%02x", state.color1.r, state.color1.g, state.color1.b);
@@ -1032,6 +1110,15 @@ String getStatusJson() {
 String getWifiScanJson() {
   JsonDocument doc;
   JsonArray arr = doc["networks"].to<JsonArray>();
+
+  if (safeModeActive) {
+    doc["scanning"] = false;
+    doc["safe_mode"] = true;
+    doc["error"] = "Safe mode active: STA scan disabled (AP-only recovery)";
+    String out;
+    serializeJson(doc, out);
+    return out;
+  }
 
   int scanState = WiFi.scanComplete();
 
@@ -1057,6 +1144,13 @@ String getWifiScanJson() {
         scanCache[scanCacheCount].rssi = WiFi.RSSI(i);
         scanCache[scanCacheCount].channel = WiFi.channel(i);
         scanCache[scanCacheCount].enc = WiFi.encryptionType(i);
+        uint8_t* bssid = WiFi.BSSID(i);
+        if (bssid != nullptr) {
+          scanCache[scanCacheCount].hasBssid = true;
+          memcpy(scanCache[scanCacheCount].bssid, bssid, 6);
+        } else {
+          scanCache[scanCacheCount].hasBssid = false;
+        }
         scanCacheCount++;
       }
     }
@@ -1091,6 +1185,105 @@ void saveLedPowerState() {
   EEPROM.write(EEPROM_POWER_ADDR, state.power ? 1 : 0);
   EEPROM.commit();
   Serial.printf("[LED] Saved power state: %s\n", state.power ? "ON" : "OFF");
+}
+
+bool isCrashResetReason(const String& reason) {
+  String r = reason;
+  r.toLowerCase();
+  return r.indexOf("wdt") >= 0 || r.indexOf("exception") >= 0 || r.indexOf("panic") >= 0;
+}
+
+void evaluateSafeModeOnBoot() {
+  EEPROM.begin(EEPROM_SIZE);
+  lastResetReason = ESP.getResetReason();
+
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC) {
+    EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
+    EEPROM.write(EEPROM_POWER_ADDR, state.power ? 1 : 0);
+    EEPROM.write(EEPROM_CRASH_COUNT_ADDR, 0);
+    EEPROM.commit();
+  }
+
+  bootCrashCount = EEPROM.read(EEPROM_CRASH_COUNT_ADDR);
+  if (isCrashResetReason(lastResetReason)) {
+    if (bootCrashCount < 250) {
+      bootCrashCount++;
+    }
+  } else if (bootCrashCount > 0) {
+    bootCrashCount--;
+  }
+
+  EEPROM.write(EEPROM_CRASH_COUNT_ADDR, bootCrashCount);
+  EEPROM.commit();
+
+  safeModeActive = bootCrashCount >= SAFE_MODE_CRASH_THRESHOLD;
+  Serial.println("[BOOT] Reset reason: " + lastResetReason);
+  Serial.printf("[BOOT] Crash counter: %u\n", bootCrashCount);
+  if (safeModeActive) {
+    Serial.println("[SAFE MODE] Triggered due to repeated crash resets");
+  }
+}
+
+void applySafeModeDefaults() {
+  state.power = true;
+  state.effect = 0;
+  state.brightness = min<uint8_t>(state.brightness, 96);
+  state.color1 = CRGB(255, 80, 0);
+  FastLED.setBrightness(state.brightness);
+  fill_solid(leds, NUM_LEDS, state.color1);
+  FastLED.show();
+}
+
+void maybeClearCrashCounterAfterStableUptime() {
+  if (safeModeActive || crashCounterCleared) {
+    return;
+  }
+  if (millis() - bootStartedAt < SAFE_MODE_CLEAR_UPTIME_MS) {
+    return;
+  }
+  if (bootCrashCount > 0) {
+    bootCrashCount = 0;
+    EEPROM.write(EEPROM_CRASH_COUNT_ADDR, 0);
+    EEPROM.commit();
+    Serial.println("[BOOT] Crash counter cleared after stable uptime");
+  }
+  crashCounterCleared = true;
+}
+
+void updateTelemetry() {
+  unsigned long nowUs = micros();
+  if (loopLastMicros != 0) {
+    loopLatencyUs = nowUs - loopLastMicros;
+    if (loopLatencyUs > loopLatencyMaxUs) {
+      loopLatencyMaxUs = loopLatencyUs;
+    }
+  }
+  loopLastMicros = nowUs;
+
+  unsigned long nowMs = millis();
+  if (lastHeapSampleAt == 0 || nowMs - lastHeapSampleAt >= 2000) {
+    lastHeapSampleAt = nowMs;
+    uint32_t heapNow = ESP.getFreeHeap();
+    if (heapWindowStartedAt == 0 || nowMs - heapWindowStartedAt > 60000) {
+      heapWindowStartedAt = nowMs;
+      heapWindowStart = heapNow;
+      heapWindowMin = heapNow;
+      heapWindowMax = heapNow;
+    } else {
+      if (heapNow < heapWindowMin) heapWindowMin = heapNow;
+      if (heapNow > heapWindowMax) heapWindowMax = heapNow;
+    }
+    heapTrendDelta = (int32_t)heapNow - (int32_t)heapWindowStart;
+  }
+
+  bool nowConnected = WiFi.status() == WL_CONNECTED;
+  if (nowConnected && !wifiWasConnected) {
+    if (wifiEverConnected) {
+      wifiReconnectCount++;
+    }
+    wifiEverConnected = true;
+  }
+  wifiWasConnected = nowConnected;
 }
 
 uint32_t getMaxUpdateSize() {
@@ -1193,6 +1386,10 @@ String getCaptivePortalUrl() {
 }
 
 bool startWiFiConnect(const String& ssid, const String& pass) {
+  if (safeModeActive) {
+    return false;
+  }
+
   if (ssid.length() == 0) {
     return false;
   }
@@ -1201,8 +1398,16 @@ bool startWiFiConnect(const String& ssid, const String& pass) {
     return false;
   }
 
-  WiFi.mode(WIFI_AP_STA);
+  Serial.println("[WiFi] Switching to STA-only mode for connection attempt");
+  
+  WiFi.disconnect(false);
+  delay(200);
+  
+  WiFi.mode(WIFI_STA);
+  delay(100);
   WiFi.hostname(localHostname.c_str());
+  
+  WiFi.persistent(false);
 
   wifiConnect.attemptedSsid = ssid;
   wifiConnect.passLen = pass.length();
@@ -1211,8 +1416,10 @@ bool startWiFiConnect(const String& ssid, const String& pass) {
   wifiConnect.targetChannel = -1;
   wifiConnect.targetRssi = 0;
   wifiConnect.targetEnc = -1;
+  wifiConnect.targetHasBssid = false;
   wifiConnect.lastElapsedMs = 0;
 
+  // Check scan cache for channel and encryption info (for diagnostics only, not used for connection)
   if (scanCacheCount > 0) {
     for (int i = 0; i < scanCacheCount; i++) {
       if (scanCache[i].ssid == ssid) {
@@ -1220,16 +1427,72 @@ bool startWiFiConnect(const String& ssid, const String& pass) {
         wifiConnect.targetChannel = scanCache[i].channel;
         wifiConnect.targetRssi = scanCache[i].rssi;
         wifiConnect.targetEnc = scanCache[i].enc;
+        wifiConnect.targetHasBssid = scanCache[i].hasBssid;
+        if (scanCache[i].hasBssid) {
+          memcpy(wifiConnect.targetBssid, scanCache[i].bssid, 6);
+        }
         break;
       }
     }
   }
 
-  WiFi.begin(ssid.c_str(), pass.c_str());
+  if (!wifiConnect.targetSeenInScan) {
+    int scanCount = WiFi.scanNetworks(false, true);
+    scanCacheCount = 0;
+    for (int i = 0; i < scanCount; i++) {
+      String foundSsid = WiFi.SSID(i);
+      if (foundSsid.length() == 0) continue;
+      if (scanCacheCount < MAX_SCAN_CACHE) {
+        scanCache[scanCacheCount].ssid = foundSsid;
+        scanCache[scanCacheCount].rssi = WiFi.RSSI(i);
+        scanCache[scanCacheCount].channel = WiFi.channel(i);
+        scanCache[scanCacheCount].enc = WiFi.encryptionType(i);
+        uint8_t* bssid = WiFi.BSSID(i);
+        if (bssid != nullptr) {
+          scanCache[scanCacheCount].hasBssid = true;
+          memcpy(scanCache[scanCacheCount].bssid, bssid, 6);
+        } else {
+          scanCache[scanCacheCount].hasBssid = false;
+        }
+        scanCacheCount++;
+      }
+
+      if (foundSsid == ssid) {
+        wifiConnect.targetSeenInScan = true;
+        wifiConnect.targetChannel = WiFi.channel(i);
+        wifiConnect.targetRssi = WiFi.RSSI(i);
+        wifiConnect.targetEnc = WiFi.encryptionType(i);
+        uint8_t* bssid = WiFi.BSSID(i);
+        if (bssid != nullptr) {
+          wifiConnect.targetHasBssid = true;
+          memcpy(wifiConnect.targetBssid, bssid, 6);
+        }
+      }
+    }
+    scanCacheUpdatedAt = millis();
+    WiFi.scanDelete();
+  }
+
+  if (wifiConnect.targetChannel > 0 && wifiConnect.targetHasBssid) {
+    Serial.printf("[WiFi] Using channel %d + BSSID lock\n", wifiConnect.targetChannel);
+    WiFi.begin(ssid.c_str(), pass.c_str(), wifiConnect.targetChannel, wifiConnect.targetBssid, true);
+  } else if (wifiConnect.targetChannel > 0) {
+    Serial.printf("[WiFi] Using channel %d from scan cache\n", wifiConnect.targetChannel);
+    WiFi.begin(ssid.c_str(), pass.c_str(), wifiConnect.targetChannel);
+  } else {
+    WiFi.begin(ssid.c_str(), pass.c_str());
+  }
+  delay(200);
+  
   Serial.println("[WiFi] Connecting...");
   Serial.println("[WiFi] SSID: " + ssid);
   Serial.printf("[WiFi] Password length: %u\n", wifiConnect.passLen);
+  Serial.printf("[WiFi] ESP8266 MAC: %s\n", WiFi.macAddress().c_str());
   Serial.printf("[WiFi] Status before begin: %s (%d)\n", wifiStatusToString(wifiConnect.lastStatus), wifiConnect.lastStatus);
+  Serial.printf("[WiFi] WiFi mode: %d (1=STA, 2=AP, 3=AP_STA)\n", (int)WiFi.getMode());
+  Serial.printf("[WiFi] AP enabled: %s, STA enabled: %s\n",
+    (WiFi.getMode() & WIFI_AP) ? "yes" : "no",
+    (WiFi.getMode() & WIFI_STA) ? "yes" : "no");
   if (wifiConnect.targetSeenInScan) {
     Serial.printf("[WiFi] Target seen in scan: yes, CH=%d RSSI=%d ENC=%s (%d)\n",
       wifiConnect.targetChannel,
@@ -1333,6 +1596,7 @@ void checkPeriodicStaRetry() {
   // 4. Retry interval elapsed
   // 5. No active clients (or client inactive for 2min)
   
+  if (safeModeActive) return;
   if (wifiConnect.active) return;
   if (WiFi.status() == WL_CONNECTED) return;
   if (WiFi.SSID().length() == 0) return;
@@ -1449,6 +1713,17 @@ void setupWebServer() {
   server.on("/api/wifi/connect", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
     doc["hostname"] = localHostname;
+    doc["safe_mode"] = safeModeActive;
+
+    if (safeModeActive) {
+      doc["connecting"] = false;
+      doc["connected"] = false;
+      doc["error"] = "Safe mode active: STA disabled. Reboot into normal mode after stabilizing firmware.";
+      String out;
+      serializeJson(doc, out);
+      req->send(200, "application/json", out);
+      return;
+    }
 
     if (req->hasParam("ssid")) {
       if (wifiConnect.active) {
