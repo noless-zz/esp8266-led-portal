@@ -15,9 +15,31 @@
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <ESP8266mDNS.h>
-#include <FastLED.h>
+#include <Adafruit_NeoPixel.h>
 #include <Updater.h>
 #include <EEPROM.h>
+
+// ─── CRGB Compatibility Struct ───────────────────────────
+struct CRGB {
+  uint8_t r, g, b;
+  CRGB() : r(0), g(0), b(0) {}
+  CRGB(uint8_t _r, uint8_t _g, uint8_t _b) : r(_r), g(_g), b(_b) {}
+  void nscale8(uint8_t scale) {
+    r = (uint16_t)r * (uint16_t)scale / 255;
+    g = (uint16_t)g * (uint16_t)scale / 255;
+    b = (uint16_t)b * (uint16_t)scale / 255;
+  }
+  static CRGB Black;
+  static CRGB Red;
+  static CRGB Green;
+  static CRGB Blue;
+  static CRGB White;
+};
+CRGB CRGB::Black = CRGB(0, 0, 0);
+CRGB CRGB::Red = CRGB(255, 0, 0);
+CRGB CRGB::Green = CRGB(0, 255, 0);
+CRGB CRGB::Blue = CRGB(0, 0, 255);
+CRGB CRGB::White = CRGB(255, 255, 255);
 
 // ─── Firmware Version & Build Info ───────────────────────
 #define FW_VERSION "1.0.0"
@@ -48,7 +70,186 @@ const uint8_t SAFE_MODE_CRASH_THRESHOLD = 3;
 const unsigned long SAFE_MODE_CLEAR_UPTIME_MS = 120000;
 
 // ─── Globals ─────────────────────────────────────────────
+
+// LED buffer and NeoPixel control
 CRGB leds[NUM_LEDS];
+Adafruit_NeoPixel *ledStrip = nullptr;
+uint8_t neoBrightness = 255;
+
+// NeoPixel show buffer - syncs CRGB array to NeoPixel hardware
+void neopixelShowBuffer(int count) {
+  if (!ledStrip || !leds) return;
+  for (int i = 0; i < count; i++) {
+    ledStrip->setPixelColor(i, ledStrip->Color(leds[i].r, leds[i].g, leds[i].b));
+  }
+  ledStrip->show();
+}
+
+// FastLED compatibility wrapper
+class NeoFastLEDCompat {
+public:
+  void clear(bool writeNow = false) {
+    for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB::Black;
+    if (writeNow && ledStrip) {
+      ledStrip->clear();
+      ledStrip->show();
+    }
+  }
+  void show() {
+    neopixelShowBuffer(NUM_LEDS);
+  }
+  void setBrightness(uint8_t b) {
+    neoBrightness = b;
+    if (ledStrip) ledStrip->setBrightness(b);
+  }
+  void setMaxPowerInVoltsAndMilliamps(uint8_t, uint16_t) {}
+  void addLeds(Adafruit_NeoPixel* strip) {
+    ledStrip = strip;
+  }
+} FastLED;
+
+// Forward declarations for FastLED helper functions
+void fill_solid(CRGB* leds, int count, CRGB color);
+CRGB blend(const CRGB& a, const CRGB& b, uint8_t amount);
+uint8_t beatsin8(uint16_t bpm, uint8_t min_val, uint8_t max_val);
+uint16_t beatsin16(uint16_t bpm, uint16_t min_val, uint16_t max_val);
+uint8_t qsub8(uint8_t a, uint8_t b);
+uint8_t qadd8(uint8_t a, uint8_t b);
+uint8_t random8(uint8_t min, uint8_t max);
+uint8_t random8();
+uint8_t random8(uint8_t max);
+uint16_t random16(uint16_t min, uint16_t max);
+uint16_t random16(uint16_t max);
+uint8_t sin8(uint8_t phase);
+CRGB HeatColor(uint8_t Temperature);
+void fill_rainbow(CRGB* leds, int count, uint8_t startHue, uint8_t deltaHue);
+void fill_gradient_RGB(CRGB* leds, int startIdx, CRGB startColor, int endIdx, CRGB endColor);
+void fadeToBlackBy(CRGB* leds, int count, uint8_t amount);
+CRGB hsvToRgb(uint8_t h, uint8_t s, uint8_t v);
+
+// Helper function: fill array with solid color
+void fill_solid(CRGB* leds, int count, CRGB color) {
+  for (int i = 0; i < count; i++) {
+    leds[i] = color;
+  }
+}
+
+// Helper function: scale brightness
+uint8_t nscale8(uint8_t val, uint8_t scale) {
+  return (uint16_t)val * (uint16_t)scale / 255;
+}
+
+// FastLED math helpers
+uint8_t qsub8(uint8_t a, uint8_t b) {
+  return (a > b) ? (a - b) : 0;
+}
+
+uint8_t qadd8(uint8_t a, uint8_t b) {
+  uint16_t sum = (uint16_t)a + (uint16_t)b;
+  return (sum > 255) ? 255 : (uint8_t)sum;
+}
+
+uint8_t random8(uint8_t min, uint8_t max) {
+  return min + (uint16_t)random(max - min);
+}
+
+uint8_t random8() {
+  return random(256);
+}
+
+uint8_t random8(uint8_t max) {
+  return random(max);
+}
+
+uint16_t random16(uint16_t min, uint16_t max) {
+  return min + random(max - min);
+}
+
+// Overload for single argument - treats it as max value (0 to max)
+uint16_t random16(uint16_t max) {
+  return random(max);
+}
+
+// Sine wave (0-255 phase range)
+uint8_t sin8(uint8_t phase) {
+  return (uint8_t)((1.0 + sin(phase * 3.14159 / 128.0)) * 127.5);
+}
+
+// Beat sine with BPM
+uint16_t beatsin16(uint16_t bpm, uint16_t min_val, uint16_t max_val) {
+  uint32_t beatVal = (millis() * bpm / 60000) % 256;
+  uint16_t val = sin8(beatVal);
+  return min_val + ((uint32_t)val * (max_val - min_val) / 255);
+}
+
+uint8_t beatsin8(uint16_t bpm, uint8_t min_val, uint8_t max_val) {
+  return (uint8_t)beatsin16(bpm, min_val, max_val);
+}
+
+// HSV to RGB conversion
+CRGB hsvToRgb(uint8_t h, uint8_t s, uint8_t v) {
+  uint8_t region = h / 43;
+  uint8_t remainder = (h % 43) * 6;
+  uint8_t p = (v * (255 - s)) / 255;
+  uint8_t q = (v * (255 - ((s * remainder) / 256))) / 255;
+  uint8_t t = (v * (255 - ((s * (256 - remainder)) / 256))) / 255;
+  
+  switch (region) {
+    case 0: return CRGB(v, t, p);
+    case 1: return CRGB(q, v, p);
+    case 2: return CRGB(p, v, t);
+    case 3: return CRGB(p, q, v);
+    case 4: return CRGB(t, p, v);
+    default: return CRGB(v, p, q);
+  }
+}
+
+// Heat color (for fire effect)
+CRGB HeatColor(uint8_t Temperature) {
+  if (Temperature < 85) {
+    return CRGB(Temperature * 3, 0, 0);
+  } else if (Temperature < 170) {
+    return CRGB(255, (Temperature - 85) * 3, 0);
+  } else {
+    return CRGB(255, 255, (Temperature - 170) * 3);
+  }
+}
+
+// Fill with rainbow gradient
+void fill_rainbow(CRGB* leds, int count, uint8_t startHue, uint8_t deltaHue) {
+  for (int i = 0; i < count; i++) {
+    leds[i] = hsvToRgb(startHue + (i * deltaHue), 255, 255);
+  }
+}
+
+// Fill RGB gradient
+void fill_gradient_RGB(CRGB* leds, int startIdx, CRGB startColor, int endIdx, CRGB endColor) {
+  int range = endIdx - startIdx;
+  for (int i = startIdx; i <= endIdx; i++) {
+    uint8_t weight = (i - startIdx) * 255 / range;
+    leds[i] = blend(startColor, endColor, weight);
+  }
+}
+
+// Fade to black
+void fadeToBlackBy(CRGB* leds, int count, uint8_t amount) {
+  for (int i = 0; i < count; i++) {
+    leds[i].r = qsub8(leds[i].r, amount);
+    leds[i].g = qsub8(leds[i].g, amount);
+    leds[i].b = qsub8(leds[i].b, amount);
+  }
+}
+
+// Blend two colors
+CRGB blend(const CRGB& a, const CRGB& b, uint8_t amount) {
+  uint16_t inv = 255 - amount;
+  return CRGB(
+    (uint8_t)(((uint16_t)a.r * inv + (uint16_t)b.r * amount) / 255),
+    (uint8_t)(((uint16_t)a.g * inv + (uint16_t)b.g * amount) / 255),
+    (uint8_t)(((uint16_t)a.b * inv + (uint16_t)b.b * amount) / 255)
+  );
+}
+
 AsyncWebServer server(80);
 DNSServer dnsServer;
 String deviceId;
@@ -1098,9 +1299,14 @@ void setupOTA() {
 
 // ─── LEDs ────────────────────────────────────────────────
 void setupLEDs() {
-  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.setBrightness(state.brightness);
-  FastLED.clear(true);
+  // Initialize NeoPixel with W-channel support (NEO_GRBW for 4-channel RGBW)
+  if (ledStrip) delete ledStrip;
+  ledStrip = new Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRBW + NEO_KHZ800);
+  ledStrip->begin();
+  ledStrip->setBrightness(state.brightness);
+  ledStrip->clear();
+  ledStrip->show();
+  Serial.println("[LED] NeoPixel initialized with W-channel support (RGBW 4-channel mode)");
 }
 
 void updateLEDs() {
@@ -1109,8 +1315,10 @@ void updateLEDs() {
   }
 
   if (!state.power) {
-    EVERY_N_MILLISECONDS(100) {
+    static unsigned long lastPowerOffClear = 0;
+    if (millis() - lastPowerOffClear >= 100) {
       FastLED.clear(true);
+      lastPowerOffClear = millis();
     }
     return;
   }
